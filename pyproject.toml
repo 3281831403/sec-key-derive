@@ -1,0 +1,10 @@
+[project]
+name = "sec-key-derive"
+version = "0.1.0"
+description = "Purpose separated key derivation exercises"
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
