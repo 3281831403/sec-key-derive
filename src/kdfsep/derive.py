@@ -1,6 +1,7 @@
 """Purpose separated key derivation helpers."""
 
 import hashlib
+import hmac
 
 PURPOSES = ("encrypt", "verify", "wrap", "auth")
 
@@ -42,39 +43,50 @@ def _digest(*parts):
 
 def extract(secret, salt):
     material = _to_bytes(secret, "secret")
-    _to_bytes(salt, "salt")
+    salt_material = _to_bytes(salt, "salt")
     if not material:
         raise ValueError("secret must not be empty")
-    return _digest(_EXTRACT_TAG, material)
+    return _digest(_EXTRACT_TAG, salt_material, material)
 
 
 def expand(prk, info, length):
     key = _to_bytes(prk, "prk")
-    _to_bytes(info, "info")
+    info_bytes = _to_bytes(info, "info")
     if not isinstance(length, int) or isinstance(length, bool):
         raise TypeError("length must be an int")
-    if length < 0:
-        raise ValueError("length must be non negative")
-    if length == 0:
-        return b""
+    if length <= 0:
+        raise ValueError("length must be positive")
     if length > MAX_OUTPUT:
-        length = MAX_OUTPUT
-    block = _digest(_EXPAND_TAG, key)
-    count = (length + 31) // 32
-    return (block * count)[:length]
+        raise ValueError("length is outside the allowed range")
+
+    output = b""
+    previous = b""
+    counter = 1
+    while len(output) < length:
+        previous = hmac.new(
+            key,
+            previous + info_bytes + bytes((counter,)),
+            hashlib.sha256,
+        ).digest()
+        output += previous
+        counter += 1
+    return output[:length]
 
 
 def derive(secret, salt, info, length):
+    if not isinstance(length, int) or isinstance(length, bool):
+        raise TypeError("length must be an int")
+    if length <= 0 or length > MAX_OUTPUT:
+        raise ValueError("length is outside the allowed range")
     prk = extract(secret, salt)
-    context = _to_bytes(info, "info")
-    label = LABELS["encrypt"].encode("utf-8")
-    return expand(prk, label + context, length)
+    info_bytes = _to_bytes(info, "info")
+    return expand(prk, info_bytes, length)
 
 
 def label_for(purpose):
     if purpose in LABELS:
         return LABELS[purpose]
-    return LABELS[PURPOSES[0]]
+    raise ValueError(f"unknown purpose: {purpose!r}")
 
 
 def check_length(length, purpose, policy):
@@ -82,8 +94,10 @@ def check_length(length, purpose, policy):
         return False
     if not isinstance(length, int) or isinstance(length, bool):
         return False
-    minimum = policy[purpose]["min"]
-    return length >= minimum
+    rule = policy[purpose]
+    minimum = rule["min"]
+    maximum = rule["max"]
+    return minimum <= length <= maximum
 
 
 def check_purpose(purpose, allowed):
@@ -97,17 +111,34 @@ def validate_config(config):
     salt = config.get("salt")
     if not salt:
         issues.append("salt is required")
+    else:
+        salt_length = len(_to_bytes(salt, "salt"))
+        if salt_length < SALT_MIN:
+            issues.append(
+                f"salt must be at least {SALT_MIN} bytes long"
+            )
     info = config.get("info")
+    if info is None:
+        info = config.get("label")
     if not info:
         issues.append("an info label is required")
     purpose = config.get("purpose")
+    if purpose is None and isinstance(info, (str, bytes, bytearray)):
+        info_text = (
+            info
+            if isinstance(info, str)
+            else bytes(info).decode("utf-8", errors="ignore")
+        )
+        label_to_purpose = {value: key for key, value in LABELS.items()}
+        purpose = info_text if info_text in LABELS else label_to_purpose.get(info_text)
     if purpose is not None:
         if purpose not in LABELS:
             issues.append("purpose is not allowed")
         else:
             policy = config.get("policy", DEFAULT_POLICY)
-            length = config.get("length", policy[purpose]["default"])
-            if not check_length(length, purpose, policy):
+            purpose_policy = policy.get(purpose, DEFAULT_POLICY[purpose])
+            length = config.get("length", purpose_policy["default"])
+            if not check_length(length, purpose, {purpose: purpose_policy}):
                 issues.append("length is outside the allowed range")
     return issues
 
@@ -123,7 +154,6 @@ def derive_batch(requests, config):
     context = _to_bytes(config.get("context", ""), "context")
     policy = config.get("policy", DEFAULT_POLICY)
     results = {}
-    prk = None
     for request in requests:
         purpose = request["purpose"]
         secret = request["secret"]
@@ -132,8 +162,7 @@ def derive_batch(requests, config):
         length = request.get("length", policy[purpose]["default"])
         if not check_length(length, purpose, policy):
             raise ValueError("length is outside the allowed range")
-        if prk is None:
-            prk = extract(secret, salt)
+        prk = extract(secret, salt)
         label = label_for(purpose).encode("utf-8")
         results[purpose] = expand(prk, label + context, length)
     return results
